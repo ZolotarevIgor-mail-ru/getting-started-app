@@ -1,0 +1,433 @@
+==============================================================================
+/home/yngvar/getting-started-app/app/roles/api.lua
+==============================================================================
+ 4 local vshard = require('vshard')
+ 4 local cartridge = require('cartridge')
+ 4 local errors = require('errors')
+
+ 4 local err_vshard_router = errors.new_class("Vshard routing error")
+ 4 local err_httpd = errors.new_class("httpd error")
+
+   local function http_customer_add(req)
+*0     local customer = req:json()
+
+*0     local bucket_id = vshard.router.bucket_id(customer.customer_id)
+*0     customer.bucket_id = bucket_id
+
+*0     local _, error = err_vshard_router:pcall(
+*0         vshard.router.call,
+           bucket_id,
+           'write',
+           'customer_add',
+*0         {customer}
+       )
+
+*0     if error then
+*0         local resp = req:render({json = {
+               info = "Internal error",
+*0             error = error
+*0         }})
+*0         resp.status = 500
+*0         return resp
+       end
+
+*0     local resp = req:render({json = { info = "Successfully created" }})
+*0     resp.status = 201
+*0     return resp
+   end
+
+   local function http_customer_get(req)
+*0     local customer_id = tonumber(req:stash('customer_id'))
+
+*0     local bucket_id = vshard.router.bucket_id(customer_id)
+
+*0     local customer, error = err_vshard_router:pcall(
+*0         vshard.router.call,
+           bucket_id,
+           'read',
+           'customer_lookup',
+*0         {customer_id}
+       )
+
+*0     if error then
+*0         local resp = req:render({json = {
+               info = "Internal error",
+*0             error = error
+*0         }})
+*0         resp.status = 500
+*0         return resp
+       end
+
+*0     if customer == nil then
+*0         local resp = req:render({json = {
+               info = "Customer not found",
+*0             error = error
+*0         }})
+*0         resp.status = 404
+*0         return resp
+       end
+
+*0     customer.bucket_id = nil
+*0     local resp = req:render({json = customer})
+*0     resp.status = 200
+*0     return resp
+   end
+
+   local function http_customer_update_balance(req)
+*0     local customer_id = tonumber(req:stash('customer_id'))
+*0     local body = req:json()
+*0     local account_id = tonumber(body["account_id"])
+*0     local amount = body["amount"]
+
+*0     local bucket_id = vshard.router.bucket_id(customer_id)
+
+*0     local balance, error = err_vshard_router:pcall(
+*0         vshard.router.call,
+           bucket_id,
+           'read',
+           'customer_update_balance',
+*0         {customer_id, account_id, amount}
+       )
+
+*0     if error then
+*0         local resp = req:render({json = {
+               info = "Internal error",
+*0             error = error
+*0         }})
+*0         resp.status = 500
+*0         return resp
+       end
+
+*0     if balance == nil then
+*0         local resp = req:render({json = { info = "Account not found" }})
+*0         resp.status = 404
+*0         return resp
+       end
+
+*0     local resp = req:render({json = {balance = balance}})
+*0     resp.status = 200
+*0     return resp
+   end
+
+   local function init(opts)
+*0     rawset(_G, 'vshard', vshard)
+
+*0     if opts.is_master then
+*0         box.schema.user.grant('guest',
+               'read,write,execute',
+               'universe',
+*0             nil, { if_not_exists = true }
+           )
+       end
+
+*0     local httpd = cartridge.service_get('httpd')
+
+*0     if not httpd then
+*0         return nil, err_httpd:new("not found")
+       end
+
+       -- assigning handler functions
+*0     httpd:route(
+*0         { path = '/storage/customers/create', method = 'POST', public = true },
+           http_customer_add
+       )
+*0     httpd:route(
+*0         { path = '/storage/customers/:customer_id', method = 'GET', public = true },
+           http_customer_get
+       )
+*0     httpd:route(
+*0         { path = '/storage/customers/:customer_id/update_balance', method = 'POST', public = true },
+           http_customer_update_balance
+       )
+
+*0     return true
+   end
+
+ 4 return {
+       role_name = 'api',
+ 4     init = init,
+ 4     dependencies = {'cartridge.roles.vshard-router'},
+ 4 }
+
+==============================================================================
+/home/yngvar/getting-started-app/app/roles/custom.lua
+==============================================================================
+ 3 local cartridge = require('cartridge')
+
+   local function init(opts) -- luacheck: no unused args
+       -- if opts.is_master then
+       -- end
+
+ 3     local httpd = cartridge.service_get('httpd')
+ 6     httpd:route({method = 'GET', path = '/hello'}, function()
+*0         return {body = 'Hello world!'}
+       end)
+
+ 3     return true
+   end
+
+   local function stop()
+   end
+
+   local function validate_config(conf_new, conf_old) -- luacheck: no unused args
+ 3     return true
+   end
+
+   local function apply_config(conf, opts) -- luacheck: no unused args
+       -- if opts.is_master then
+       -- end
+
+ 3     return true
+   end
+
+ 3 return {
+       role_name = 'app.roles.custom',
+ 3     init = init,
+ 3     stop = stop,
+ 3     validate_config = validate_config,
+ 3     apply_config = apply_config,
+       -- dependencies = {'cartridge.roles.vshard-router'},
+ 3 }
+
+==============================================================================
+/home/yngvar/getting-started-app/app/roles/storage.lua
+==============================================================================
+   -- module for checking arguments in functions
+ 4 local checks = require('checks')
+
+   -- module for working with numbers
+ 4 local decnumber = require('ldecnumber')
+
+   local function init_spaces()
+*0     local customer = box.schema.space.create(
+           -- name of the space for storing customers
+           'customer',
+           -- extra parameters
+           {
+               -- format for stored tuples
+*0             format = {
+*0                 {'customer_id', 'unsigned'},
+*0                 {'bucket_id', 'unsigned'},
+*0                 {'name', 'string'},
+               },
+               -- creating the space only if it doesn't exist
+               if_not_exists = true,
+           }
+       )
+
+       -- creating an index by customer's id
+*0     customer:create_index('customer_id', {
+           parts = {'customer_id'},
+           if_not_exists = true,
+       })
+
+*0     customer:create_index('bucket_id', {
+           parts = {'bucket_id'},
+           unique = false,
+           if_not_exists = true,
+       })
+
+       -- similarly, creating a space for accounts
+*0     local account = box.schema.space.create('account', {
+*0         format = {
+*0             {'account_id', 'unsigned'},
+*0             {'customer_id', 'unsigned'},
+*0             {'bucket_id', 'unsigned'},
+*0             {'balance', 'string'},
+*0             {'name', 'string'},
+           },
+           if_not_exists = true,
+       })
+
+       -- similar indexes
+*0     account:create_index('account_id', {
+           parts = {'account_id'},
+           if_not_exists = true,
+       })
+*0     account:create_index('customer_id', {
+           parts = {'customer_id'},
+           unique = false,
+           if_not_exists = true,
+       })
+
+*0     account:create_index('bucket_id', {
+           parts = {'bucket_id'},
+           unique = false,
+           if_not_exists = true,
+       })
+   end
+
+   local function customer_add(customer)
+*0     customer.accounts = customer.accounts or {}
+
+       -- opening a transaction
+*0     box.begin()
+
+       -- inserting a tuple into the customer space
+*0     box.space.customer:insert({
+*0         customer.customer_id,
+*0         customer.bucket_id,
+           customer.name
+       })
+*0     for _, account in ipairs(customer.accounts) do
+           -- inserting a tuple into the account space
+*0         box.space.account:insert({
+*0             account.account_id,
+*0             customer.customer_id,
+*0             customer.bucket_id,
+               '0.00',
+               account.name
+           })
+       end
+
+       -- committing the transaction
+*0     box.commit()
+*0     return true
+   end
+
+   local function customer_update_balance(customer_id, account_id, amount)
+       -- checking function arguments
+*0     checks('number', 'number', 'string')
+
+       -- finding the required account in the database
+*0     local account = box.space.account:get(account_id)
+*0     if account == nil then   -- checking if the account was found
+*0         return nil
+       end
+
+       -- checking if the requested account belong to the customer
+*0     if account.customer_id ~= customer_id then
+*0         error('Invalid account_id')
+       end
+
+       -- converting a balance string to a number
+*0     local balance_decimal = decnumber.tonumber(account.balance)
+*0     balance_decimal = balance_decimal + amount
+*0     if balance_decimal:isnan() then
+*0         error('Invalid amount')
+       end
+
+       -- rounding to 2 decimal points and converting the balance
+       -- back to string
+*0     local new_balance = balance_decimal:rescale(-2):tostring()
+
+       -- updating the balance
+*0     box.space.account:update({ account_id }, {
+*0         { '=', 4, new_balance }
+       })
+
+*0     return new_balance
+   end
+
+   local function customer_lookup(customer_id)
+*0     checks('number')
+
+*0     local customer = box.space.customer:get(customer_id)
+*0     if customer == nil then
+*0         return nil
+       end
+*0     customer = {
+           customer_id = customer.customer_id;
+           name = customer.name;
+       }
+*0     local accounts = {}
+*0     for _, account in box.space.account.index.customer_id:pairs(customer_id) do
+*0         table.insert(accounts, {
+               account_id = account.account_id;
+               name = account.name;
+               balance = account.balance;
+           })
+       end
+*0     customer.accounts = accounts;
+
+*0     return customer
+   end
+
+   local function init(opts)
+*0     if opts.is_master then
+
+           -- calling the space initialization function
+*0         init_spaces()
+
+*0         box.schema.func.create('customer_add', {if_not_exists = true})
+*0         box.schema.func.create('customer_lookup', {if_not_exists = true})
+*0         box.schema.func.create('customer_update_balance', {if_not_exists = true})
+
+*0         box.schema.role.grant('public', 'execute', 'function', 'customer_add', {if_not_exists = true})
+*0         box.schema.role.grant('public', 'execute', 'function', 'customer_lookup', {if_not_exists = true})
+*0         box.schema.role.grant('public', 'execute', 'function', 'customer_update_balance', {if_not_exists = true})
+       end
+
+*0     rawset(_G, 'customer_add', customer_add)
+*0     rawset(_G, 'customer_lookup', customer_lookup)
+*0     rawset(_G, 'customer_update_balance', customer_update_balance)
+
+*0     return true
+   end
+
+ 4 return {
+       role_name = 'storage',
+ 4     init = init,
+ 4     dependencies = {
+           'cartridge.roles.vshard-storage',
+ 4     },
+ 4 }
+
+==============================================================================
+/home/yngvar/getting-started-app/init.lua
+==============================================================================
+   #!/usr/bin/env tarantool
+
+ 4 require('strict').on()
+
+ 4 if package.setsearchroot ~= nil then
+ 8     package.setsearchroot()
+   else
+       -- Workaround for rocks loading in tarantool 1.10
+       -- It can be removed in tarantool > 2.2
+       -- By default, when you do require('mymodule'), tarantool looks into
+       -- the current working directory and whatever is specified in
+       -- package.path and package.cpath. If you run your app while in the
+       -- root directory of that app, everything goes fine, but if you try to
+       -- start your app with "tarantool myapp/init.lua", it will fail to load
+       -- its modules, and modules from myapp/.rocks.
+*0     local fio = require('fio')
+*0     local app_dir = fio.abspath(fio.dirname(arg[0]))
+*0     print('App dir set to ' .. app_dir)
+*0     package.path = app_dir .. '/?.lua;' .. package.path
+*0     package.path = app_dir .. '/?/init.lua;' .. package.path
+*0     package.path = app_dir .. '/.rocks/share/tarantool/?.lua;' .. package.path
+*0     package.path = app_dir .. '/.rocks/share/tarantool/?/init.lua;' .. package.path
+*0     package.cpath = app_dir .. '/?.so;' .. package.cpath
+*0     package.cpath = app_dir .. '/?.dylib;' .. package.cpath
+*0     package.cpath = app_dir .. '/.rocks/lib/tarantool/?.so;' .. package.cpath
+*0     package.cpath = app_dir .. '/.rocks/lib/tarantool/?.dylib;' .. package.cpath
+   end
+
+ 4 local cartridge = require('cartridge')
+ 8 local ok, err = cartridge.cfg({
+       workdir = 'tmp/db',
+ 4     roles = {
+           'cartridge.roles.vshard-storage',
+           'cartridge.roles.vshard-router',
+           'app.roles.api',
+           'app.roles.storage',
+ 1         'app.roles.custom'
+ 3     },
+       cluster_cookie = 'getting-started-app-cluster-cookie',
+   })
+
+ 3 assert(ok, tostring(err))
+
+==============================================================================
+Summary
+==============================================================================
+
+File                                                   Hits Missed Coverage
+---------------------------------------------------------------------------
+/home/yngvar/getting-started-app/app/roles/api.lua     9    71     11.25%
+/home/yngvar/getting-started-app/app/roles/custom.lua  12   1      92.31%
+/home/yngvar/getting-started-app/app/roles/storage.lua 7    65     9.72%
+/home/yngvar/getting-started-app/init.lua              9    11     45.00%
+---------------------------------------------------------------------------
+Total                                                  37   148    20.00%
